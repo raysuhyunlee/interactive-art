@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Soap Bubble Wand</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #fff;
+  }
+  #three-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  /* hidden source video — drawn into Three.js via VideoTexture */
+  #webcam {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    /* mirroring is done in code (sx() helper), not CSS, so text stays readable */
+  }
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    padding: 10px 18px;
+    border-radius: 999px;
+    background: rgba(0,0,0,0.35);
+    backdrop-filter: blur(6px);
+    font-size: 14px;
+    letter-spacing: 0.3px;
+    color: rgba(255,255,255,0.85);
+    pointer-events: none;
+    transition: opacity 0.6s ease;
+    text-align: center;
+    white-space: nowrap;
+  }
+  #status {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.55);
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="three-canvas"></canvas>
+  <canvas id="overlay"></canvas>
+  <div id="status">starting…</div>
+  <div id="hint">Pinch fingers to pick a shape • Round your mouth and blow to release bubbles</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+
+<script>
+/* ============================================================
+   Soap Bubble Wand — Three.js + MediaPipe Holistic
+   Single-file interactive media art.
+   ============================================================ */
+
+// ---------- DOM ----------
+const video      = document.getElementById('webcam');
+const overlay    = document.getElementById('overlay');
+const octx       = overlay.getContext('2d');
+const statusEl   = document.getElementById('status');
+const hintEl     = document.getElementById('hint');
+
+// ---------- Three.js core ----------
+const renderer = new THREE.WebGLRenderer({
+  canvas: document.getElementById('three-canvas'),
+  antialias: true,
+  alpha: false
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.autoClear = false; // we composite background + bubbles by hand
+
+const scene  = new THREE.Scene();
+
+// Perspective camera facing the user; world units roughly normalized.
+// Camera sits at +Z looking toward -Z. Bubbles spawn near z=0 and travel +Z (toward camera).
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 0, 5);
+camera.lookAt(0, 0, 0);
+
+// Separate scene for the fullscreen webcam background (own ortho cam).
+const bgScene  = new THREE.Scene();
+const bgCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+let videoTexture = null;
+let bgMesh = null;
+
+// ---------- World mapping ----------
+// MediaPipe gives normalized coords x,y in [0,1] (x already in video space).
+// We mirror x (1-x) so motion matches the mirrored webcam.
+// Map to a plane at z=0 sized to roughly fill the camera frustum.
+const PLANE_Z = 0;
+let frustumHalfH = Math.tan((camera.fov * Math.PI / 180) / 2) * (camera.position.z - PLANE_Z);
+let frustumHalfW = frustumHalfH * camera.aspect;
+
+function normToWorld(nx, ny) {
+  // nx,ny already mirrored upstream. y inverted (image y-down -> world y-up).
+  const x = (nx - 0.5) * 2 * frustumHalfW;
+  const y = (0.5 - ny) * 2 * frustumHalfH;
+  return new THREE.Vector3(x, y, PLANE_Z);
+}
+
+// ============================================================
+//  BUBBLE SHADER MATERIAL
+// ============================================================
+const bubbleVertexShader = `
+  uniform float uTime;
+  uniform float uPhase;
+  uniform float uWobble;
+  uniform float uTri;   // shape influences (0 or 1, one active at a time)
+  uniform float uRect;
+  uniform float uStar;
+  varying vec3  vNormal;
+  varying vec3  vViewDir;
+  varying vec3  vWorldNormal;
+  varying vec3  vLocalPos;   // undeformed model-space position (for pop dissolve)
+
+  const float PI = 3.14159265;
+
+  // silhouette radius for the cross-section at angle a
+  float rTri(float a)  { return 1.0 / (0.80 + 0.20 * cos(3.0 * (a - PI/2.0))); }
+  float rRect(float a) {
+    float c = pow(abs(cos(a)), 6.0);
+    float s = pow(abs(sin(a)), 6.0);
+    return 0.92 / pow(c + s, 1.0/6.0);
+  }
+  float rStar(float a) { return 0.62 + 0.42 * pow(abs(cos(2.5 * a)), 2.0); }
+
+  void main() {
+    vec3 pos = position;
+    vLocalPos = position;
+
+    // ---- shape morph: scale the xy cross-section toward a silhouette ----
+    float ang = atan(pos.y, pos.x);
+    float shapeR = 1.0;
+    shapeR = mix(shapeR, rTri(ang),  uTri);
+    shapeR = mix(shapeR, rRect(ang), uRect);
+    shapeR = mix(shapeR, rStar(ang), uStar);
+    pos.xy *= shapeR;
+    // flatten depth a touch on non-circular shapes for a "prism lens" feel
+    // NOTE: 'flat' is a reserved GLSL keyword — do not name a var that.
+    float flatten = clamp(uTri + uRect + uStar, 0.0, 1.0);
+    pos.z *= mix(1.0, 0.7, flatten);
+
+    float t = uTime + uPhase;
+    // time-based sinusoidal jello deformation
+    float wobble = sin(pos.x * 8.0 + t * 3.0) * 0.04
+                 + sin(pos.y * 6.0 + t * 2.5) * 0.03
+                 + sin(pos.z * 7.0 + t * 4.0) * 0.025;
+    vec3 newPos = pos + normal * wobble * uWobble;
+
+    vec4 worldPos = modelMatrix * vec4(newPos, 1.0);
+    vec4 viewPos  = viewMatrix * worldPos;
+
+    vNormal      = normalize(normalMatrix * normal);
+    vWorldNormal = normalize(mat3(modelMatrix) * normal);
+    vViewDir     = normalize(cameraPosition - worldPos.xyz);
+
+    gl_Position = projectionMatrix * viewPos;
+  }
+`;
+
+const bubbleFragmentShader = `
+  precision highp float;
+  uniform float uTime;
+  uniform float uPhase;
+  uniform float uOpacity;
+  uniform float uPop;    // 0 = intact, 1 = fully popped (hole grows center->out)
+  varying vec3  vNormal;
+  varying vec3  vViewDir;
+  varying vec3  vWorldNormal;
+  varying vec3  vLocalPos;
+
+  vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+  }
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(vViewDir);
+    float vDotN = abs(dot(N, V));
+
+    // ---- thin-film iridescence ----
+    float viewAngle = 1.0 - vDotN;
+    float hue = viewAngle * 4.0 + uTime * 0.3 + uPhase;
+    vec3 iridescent = hsv2rgb(vec3(fract(hue), 0.7, 1.0));
+
+    // a second, faster hue band layered for extra shimmer
+    vec3 iridescent2 = hsv2rgb(vec3(fract(hue * 1.7 + 0.33), 0.6, 1.0));
+    vec3 filmColor = mix(iridescent, iridescent2, 0.4);
+
+    // ---- fresnel transparency ----
+    float fresnel = pow(1.0 - vDotN, 3.0);
+    float alpha = mix(0.05, 0.45, fresnel) * uOpacity;
+
+    // ---- specular highlights (two fixed-ish light dirs) ----
+    vec3 L1 = normalize(vec3(0.5, 0.8, 0.6));
+    vec3 L2 = normalize(vec3(-0.6, -0.3, 0.5));
+    vec3 H1 = normalize(L1 + V);
+    vec3 H2 = normalize(L2 + V);
+    float spec1 = pow(max(dot(N, H1), 0.0), 90.0);
+    float spec2 = pow(max(dot(N, H2), 0.0), 140.0) * 0.6;
+    float spec = spec1 + spec2;
+
+    vec3 color = filmColor + vec3(spec);
+    alpha += spec * 0.5 * uOpacity;
+
+    // ---- pop dissolve: a hole opens at the center and the soap film
+    //      retracts outward, leaving a thin glowing rim that vanishes ----
+    if (uPop > 0.0) {
+      float r = length(vLocalPos.xy);     // 0 at center .. ~1 at silhouette
+      float front = uPop * 1.25;          // dissolve front grows past the edge
+      if (r < front) discard;             // film already gone here
+      // bright retracting rim just outside the hole
+      float rim = 1.0 - smoothstep(front, front + 0.18, r);
+      color += filmColor * rim * 2.0 + vec3(rim * 0.8);
+      alpha = max(alpha, rim * 0.9);
+      // overall fade-out as the pop completes
+      alpha *= (1.0 - smoothstep(0.65, 1.0, uPop));
+    }
+
+    gl_FragColor = vec4(color, alpha);
+  }
+`;
+
+// One shared material — clones get unique uniform values per bubble.
+const baseBubbleMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime:    { value: 0 },
+    uPhase:   { value: 0 },
+    uWobble:  { value: 1.0 },
+    uOpacity: { value: 1.0 },
+    uPop:     { value: 0 },
+    uTri:     { value: 0 },
+    uRect:    { value: 0 },
+    uStar:    { value: 0 }
+  },
+  vertexShader:   bubbleVertexShader,
+  fragmentShader: bubbleFragmentShader,
+  transparent: true,
+  depthWrite:  false,
+  blending:    THREE.AdditiveBlending,
+  side:        THREE.DoubleSide
+});
+
+// ============================================================
+//  BUBBLE GEOMETRY (single shared sphere; shape made in vertex shader)
+// ============================================================
+const SEG = 48;
+const baseGeo = new THREE.SphereGeometry(1, SEG, SEG);
+
+// shape -> shader uniform values (uTri, uRect, uStar). circle = all 0.
+const SHAPE_UNIFORMS = {
+  circle:    { uTri: 0, uRect: 0, uStar: 0 },
+  triangle:  { uTri: 1, uRect: 0, uStar: 0 },
+  rectangle: { uTri: 0, uRect: 1, uStar: 0 },
+  star:      { uTri: 0, uRect: 0, uStar: 1 }
+};
+// pinch fingertip count -> shape. 1 = thumb+index, up to 4 fingertips.
+const PINCH_TO_SHAPE = { 1: 'circle', 2: 'triangle', 3: 'rectangle', 4: 'star' };
+
+// ============================================================
+//  BUBBLE POOL
+// ============================================================
+const MAX_BUBBLES = 30;
+const bubbles = [];
+
+// Push current shape into a bubble's shader uniforms.
+function setBubbleShape(b, shape) {
+  const u = SHAPE_UNIFORMS[shape] || SHAPE_UNIFORMS.circle;
+  b.mat.uniforms.uTri.value  = u.uTri;
+  b.mat.uniforms.uRect.value = u.uRect;
+  b.mat.uniforms.uStar.value = u.uStar;
+  b.shape = shape;
+}
+
+// Bubble size grows with blow duration. Tunables:
+const BUBBLE_MIN_SIZE = 0.10;
+const BUBBLE_MAX_SIZE = 0.75;
+const BUBBLE_GROW_RATE = 0.32; // size units added per second of sustained blow
+
+// Create a bubble. If charging=true it stays pinned to the wand and grows
+// until released; otherwise it floats off immediately.
+function spawnBubble(worldPos, shape, charging) {
+  if (bubbles.length >= MAX_BUBBLES) return null;
+
+  const mat = baseBubbleMaterial.clone();
+  mat.uniforms.uTime    = { value: 0 };         // updated globally
+  mat.uniforms.uPhase   = { value: Math.random() * 100 };
+  mat.uniforms.uWobble  = { value: 0.8 + Math.random() * 0.8 };
+  mat.uniforms.uOpacity = { value: 1.0 };
+  mat.uniforms.uPop     = { value: 0 };
+  mat.uniforms.uTri     = { value: 0 };
+  mat.uniforms.uRect    = { value: 0 };
+  mat.uniforms.uStar    = { value: 0 };
+
+  const mesh = new THREE.Mesh(baseGeo, mat);
+  mesh.position.copy(worldPos);
+  mesh.scale.setScalar(0.001);
+  mesh.rotation.z = Math.random() * Math.PI * 2;
+  scene.add(mesh);
+
+  const b = {
+    mesh,
+    mat,
+    shape,
+    charging: !!charging,
+    fullSize: BUBBLE_MIN_SIZE,
+    age: 0,
+    life: 5 + Math.random() * 3,            // 5–8 s (set at release)
+    growT: 0,
+    growDur: 0.4,
+    popping: false,
+    popT: 0,
+    vel: new THREE.Vector3(),
+    spin: (Math.random() - 0.5) * 0.4
+  };
+  setBubbleShape(b, shape);
+  bubbles.push(b);
+  return b;
+}
+
+// Detach a charging bubble: give it launch velocity and let it float.
+function releaseBubble(b) {
+  if (!b || !b.charging) return;
+  b.charging = false;
+  b.age = 0;
+  b.growT = b.growDur; // already at size, skip grow-in
+  b.life = 5 + Math.random() * 3;
+  // bigger bubbles drift a little slower
+  const slow = THREE.MathUtils.mapLinear(b.fullSize, BUBBLE_MIN_SIZE, BUBBLE_MAX_SIZE, 1.0, 0.5);
+  b.vel.set(
+    (Math.random() - 0.5) * 0.01,
+    (0.005 + Math.random() * 0.01) * slow,
+    0.03 * slow
+  );
+}
+
+// pop droplets — tiny round specks (the film breaking into drops), camera-facing
+const popParticles = [];
+const particleGeo = new THREE.CircleGeometry(0.012, 12);
+const particleMat = new THREE.MeshBasicMaterial({
+  color: 0xffffff, transparent: true, opacity: 0.9,
+  blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+});
+
+function spawnPopRing(pos, size) {
+  const n = 6;
+  const group = { parts: [], age: 0, life: 0.45 };
+  for (let i = 0; i < n; i++) {
+    const m = new THREE.Mesh(particleGeo, particleMat.clone());
+    m.position.copy(pos);
+    const a = (i / n) * Math.PI * 2 + Math.random() * 0.5;
+    // droplets start near the rim and fly outward, then shrink+fade
+    const ringR = size * 0.9;
+    m.position.x += Math.cos(a) * ringR;
+    m.position.y += Math.sin(a) * ringR;
+    m.userData.dir = new THREE.Vector3(Math.cos(a), Math.sin(a), 0)
+      .multiplyScalar((0.02 + Math.random() * 0.02) * (size / 0.3));
+    scene.add(m);
+    group.parts.push(m);
+  }
+  popParticles.push(group);
+}
+
+function startPop(b) {
+  if (b.popping) return;
+  b.popping = true;
+  b.popT = 0;
+  b.popDur = 0.45;
+  b.mat.uniforms.uPop.value = 0.0001;
+  spawnPopRing(b.mesh.position, b.fullSize);
+}
+
+function removeBubble(idx) {
+  const b = bubbles[idx];
+  scene.remove(b.mesh);
+  b.mat.dispose();
+  bubbles.splice(idx, 1);
+}
+
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+// ============================================================
+//  BUBBLE UPDATE
+// ============================================================
+function updateBubbles(dt) {
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+
+    // Charging bubble: pinned to wand, size driven externally, no aging/pop.
+    if (b.charging) {
+      b.mesh.scale.setScalar(b.fullSize);
+      b.mesh.rotation.z += b.spin * dt * 0.3;
+      continue;
+    }
+
+    b.age += dt;
+
+    // grow in
+    if (b.growT < b.growDur) {
+      b.growT += dt;
+      const t = Math.min(b.growT / b.growDur, 1);
+      b.mesh.scale.setScalar(b.fullSize * easeOutCubic(t));
+    } else {
+      b.mesh.scale.setScalar(b.fullSize);
+    }
+
+    if (!b.popping) {
+      // drift
+      b.mesh.position.x += b.vel.x;
+      b.mesh.position.y += b.vel.y;
+      b.mesh.position.z += b.vel.z;
+      b.mesh.rotation.z += b.spin * dt;
+      // gentle horizontal sway
+      b.mesh.position.x += Math.sin(b.age * 1.5 + b.mat.uniforms.uPhase.value) * 0.0015;
+
+      // life expiry or too close to camera -> pop
+      if (b.age >= b.life || b.mesh.position.z > camera.position.z - 0.5) {
+        startPop(b);
+      }
+    } else {
+      // pop animation: soap film ruptures from the center and retracts outward.
+      // uPop drives the dissolve in the fragment shader (hole grows 0 -> edge).
+      b.popT += dt;
+      const pt = b.popT / b.popDur;
+      if (pt >= 1) { removeBubble(i); continue; }
+      b.mat.uniforms.uPop.value = pt;
+      // a tiny outward stretch as the film lets go
+      b.mesh.scale.setScalar(b.fullSize * (1 + 0.12 * easeOutCubic(pt)));
+      // keep drifting slightly while popping
+      b.mesh.position.x += b.vel.x * 0.5;
+      b.mesh.position.y += b.vel.y * 0.5;
+    }
+  }
+
+  // pop droplets: fly out, shrink and fade
+  for (let i = popParticles.length - 1; i >= 0; i--) {
+    const g = popParticles[i];
+    g.age += dt;
+    const t = g.age / g.life;
+    for (const p of g.parts) {
+      p.position.add(p.userData.dir);
+      p.userData.dir.multiplyScalar(0.92); // ease out
+      p.material.opacity = Math.max(0, 0.9 * (1 - t));
+      p.scale.setScalar(Math.max(0.01, 1 - t * 0.6));
+    }
+    if (t >= 1) {
+      for (const p of g.parts) { scene.remove(p); p.material.dispose(); }
+      popParticles.splice(i, 1);
+    }
+  }
+}
+
+// ============================================================
+//  MEDIAPIPE — HOLISTIC
+// ============================================================
+// Per-hand state for wand + pinch shape; mouth blow state.
+const handState = {
+  Left:  { active: false, shape: 'circle', pinchCount: 0, world: null, screen: null, ring: 0, charging: null, dists: null },
+  Right: { active: false, shape: 'circle', pinchCount: 0, world: null, screen: null, ring: 0, charging: null, dists: null }
+};
+
+let mouthState = { open: 0, widthN: 0, baseW: 0, purse: 1, blowing: false, blowFrames: 0 };
+
+// Pinch distance is normalized by palm size (wrist->middle-finger base) so it
+// works at any distance from the camera. A fingertip counts as pinching when
+// its distance to the thumb tip is below PINCH_RATIO * palm size.
+const PINCH_RATIO     = 0.55;
+// Blow = pursed round mouth. Detected from mouth WIDTH shrinking relative to the
+// person's own neutral mouth (corners pull in when you blow). All sizes are
+// normalized by inter-eye distance so it's invariant to camera distance.
+const BLOW_PURSE      = 0.85;   // blow when width < 85% of neutral width
+const BLOW_OPEN_MIN   = 0.015;  // mouth must be at least slightly open (eye-norm)
+const BLOW_SUSTAIN    = 3;
+
+function dist3(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y, dz = (a.z||0) - (b.z||0);
+  return Math.sqrt(dx*dx + dy*dy + dz*dz);
+}
+
+// 2D distance only. Holistic's hand-landmark z is on a different scale than
+// x/y, so including it inflated pinch distances and broke detection.
+function dist2(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+function processHand(landmarks, label) {
+  const st = handState[label];
+  if (!landmarks) { st.active = false; st.dists = null; return; }
+
+  const thumb = landmarks[4];
+  const tips  = [landmarks[8], landmarks[12], landmarks[16], landmarks[20]]; // index..pinky
+  // palm size reference: wrist (0) -> middle finger MCP (9)
+  const palm  = Math.max(1e-4, dist2(landmarks[0], landmarks[9]));
+  let pinchCount = 0;
+  let nearestTip = null, nearestDist = Infinity;
+
+  st.dists = []; // debug: palm-normalized distance thumb->each fingertip
+  for (const tip of tips) {
+    const rel = dist2(thumb, tip) / palm;
+    st.dists.push(rel);
+    if (rel < PINCH_RATIO) {
+      pinchCount++;
+      if (rel < nearestDist) { nearestDist = rel; nearestTip = tip; }
+    }
+  }
+
+  if (pinchCount >= 1) {
+    st.active = true;
+    st.pinchCount = Math.min(pinchCount, 4);
+    st.shape = PINCH_TO_SHAPE[st.pinchCount] || 'circle';
+    // wand midpoint between thumb and nearest pinching finger
+    const mid = nearestTip
+      ? { x: (thumb.x + nearestTip.x)/2, y: (thumb.y + nearestTip.y)/2 }
+      : { x: thumb.x, y: thumb.y };
+    // store RAW (unmirrored) screen coords; mirroring happens at draw time via sx()
+    st.screen = { x: mid.x, y: mid.y };
+    st.world  = normToWorld(1 - mid.x, mid.y); // world space IS mirrored
+  } else {
+    st.active = false;
+    st.pinchCount = pinchCount;
+  }
+}
+
+function processFace(faceLandmarks) {
+  if (!faceLandmarks) { mouthState.blowing = false; mouthState.blowFrames = 0; return; }
+  const upper = faceLandmarks[13];
+  const lower = faceLandmarks[14];
+  const left  = faceLandmarks[61];   // left mouth corner
+  const right = faceLandmarks[291];  // right mouth corner
+  const eyeL  = faceLandmarks[33];   // right eye outer corner
+  const eyeR  = faceLandmarks[263];  // left eye outer corner
+  if (!upper || !lower || !left || !right || !eyeL || !eyeR) return;
+
+  // stable face scale (mouth motion doesn't change inter-eye distance)
+  const faceScale = Math.max(1e-4, dist2(eyeL, eyeR));
+  const widthN  = dist2(left, right) / faceScale;   // mouth width, eye-normalized
+  const heightN = dist2(upper, lower) / faceScale;  // mouth opening, eye-normalized
+
+  // Adaptive neutral width: tracks the WIDEST recent mouth (relaxed/neutral),
+  // then decays slowly so it recovers. Pursing drops well below it.
+  if (!mouthState.baseW) mouthState.baseW = widthN;
+  mouthState.baseW = Math.max(widthN, mouthState.baseW * 0.995);
+
+  const purse = widthN / mouthState.baseW;  // ~1 neutral, < ~0.82 when blowing
+
+  mouthState.widthN = widthN;
+  mouthState.open   = heightN;
+  mouthState.purse  = purse;
+
+  // blow = corners pulled in (pursed) AND mouth slightly open (round "o")
+  const isBlow = purse < BLOW_PURSE && heightN > BLOW_OPEN_MIN;
+  if (isBlow) {
+    mouthState.blowFrames++;
+  } else {
+    mouthState.blowFrames = 0;
+  }
+  mouthState.blowing = mouthState.blowFrames >= BLOW_SUSTAIN;
+}
+
+let clockNow = 0;
+
+// While blowing AND pinching, a bubble charges at the wand and grows with the
+// blow duration. When the blow stops (or the pinch ends), it releases.
+function updateEmission(dt) {
+  for (const label of ['Left', 'Right']) {
+    const st = handState[label];
+    const charging = st.charging; // bubble currently growing on this hand
+
+    const canCharge = st.active && st.world && mouthState.blowing;
+
+    if (canCharge) {
+      if (!charging) {
+        st.charging = spawnBubble(st.world.clone(), st.shape, true);
+      } else {
+        // grow + follow wand + track shape changes
+        charging.fullSize = Math.min(BUBBLE_MAX_SIZE, charging.fullSize + BUBBLE_GROW_RATE * dt);
+        charging.mesh.position.lerp(st.world, 0.4); // smooth follow
+        setBubbleShape(charging, st.shape);
+      }
+    } else if (charging) {
+      // stopped blowing or unpinched -> let it go
+      releaseBubble(charging);
+      st.charging = null;
+    }
+  }
+}
+
+// ---------- Holistic results ----------
+let lastResults = null;
+function onResults(results) {
+  lastResults = results;
+  processHand(results.leftHandLandmarks,  'Left');
+  processHand(results.rightHandLandmarks, 'Right');
+  processFace(results.faceLandmarks);
+
+  // bind video texture once metadata is ready
+  if (!videoTexture && video.videoWidth > 0) initBackground();
+}
+
+const holistic = new Holistic({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+});
+holistic.setOptions({
+  modelComplexity: 1,
+  smoothLandmarks: true,
+  refineFaceLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+holistic.onResults(onResults);
+
+// ============================================================
+//  WEBCAM BACKGROUND
+// ============================================================
+function initBackground() {
+  videoTexture = new THREE.VideoTexture(video);
+  videoTexture.minFilter = THREE.LinearFilter;
+  videoTexture.magFilter = THREE.LinearFilter;
+  videoTexture.format = THREE.RGBFormat;
+
+  const mat = new THREE.MeshBasicMaterial({ map: videoTexture, depthTest: false, depthWrite: false });
+  // mirror horizontally by flipping the plane's x scale
+  const geo = new THREE.PlaneGeometry(2, 2);
+  bgMesh = new THREE.Mesh(geo, mat);
+  bgMesh.scale.x = -1;
+  bgScene.add(bgMesh);
+  fitBackground();
+}
+
+// cover-fit the video into the screen aspect (like background-size: cover)
+function fitBackground() {
+  if (!bgMesh || !video.videoWidth) return;
+  const screenAspect = window.innerWidth / window.innerHeight;
+  const videoAspect  = video.videoWidth / video.videoHeight;
+  // ortho cam spans [-1,1]; plane is 2x2. Scale to cover.
+  let sx = 1, sy = 1;
+  if (videoAspect > screenAspect) {
+    sx = videoAspect / screenAspect; // crop sides
+  } else {
+    sy = screenAspect / videoAspect; // crop top/bottom
+  }
+  bgMesh.scale.x = -sx; // keep mirror
+  bgMesh.scale.y = sy;
+}
+
+// ============================================================
+//  2D OVERLAY — wand outlines + shape preview
+// ============================================================
+function resizeOverlay() {
+  overlay.width  = window.innerWidth;
+  overlay.height = window.innerHeight;
+}
+
+function drawShapeOutline(ctx, cx, cy, R, shape, t) {
+  ctx.beginPath();
+  if (shape === 'circle') {
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  } else if (shape === 'triangle') {
+    for (let i = 0; i < 3; i++) {
+      const a = -Math.PI/2 + i * (2*Math.PI/3);
+      const x = cx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  } else if (shape === 'rectangle') {
+    ctx.rect(cx - R, cy - R*0.75, R*2, R*1.5);
+  } else if (shape === 'star') {
+    for (let i = 0; i < 10; i++) {
+      const rr = (i % 2 === 0) ? R : R * 0.45;
+      const a  = -Math.PI/2 + i * Math.PI/5;
+      const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+}
+
+// toggle landmark debug overlay with the "d" key
+let DEBUG = true;
+window.addEventListener('keydown', (e) => { if (e.key === 'd') DEBUG = !DEBUG; });
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],            // thumb
+  [0,5],[5,6],[6,7],[7,8],            // index
+  [5,9],[9,10],[10,11],[11,12],       // middle
+  [9,13],[13,14],[14,15],[15,16],     // ring
+  [13,17],[17,18],[18,19],[19,20],    // pinky
+  [0,17]                              // palm base
+];
+
+// mirror normalized x to screen pixels (we mirror in code, not CSS)
+function SX(x, W) { return (1 - x) * W; }
+
+function drawHand(ctx, lm, W, H, color) {
+  if (!lm) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    ctx.beginPath();
+    ctx.moveTo(SX(lm[a].x, W), lm[a].y * H);
+    ctx.lineTo(SX(lm[b].x, W), lm[b].y * H);
+    ctx.stroke();
+  }
+  for (let i = 0; i < lm.length; i++) {
+    const tip = (i === 4 || i === 8 || i === 12 || i === 16 || i === 20);
+    ctx.fillStyle = (i === 4) ? '#ff3b3b' : (tip ? '#ffd23b' : color);
+    ctx.beginPath();
+    ctx.arc(SX(lm[i].x, W), lm[i].y * H, tip ? 6 : 3, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawDebugLandmarks(W, H) {
+  if (!lastResults) return;
+  drawHand(octx, lastResults.leftHandLandmarks,  W, H, 'rgba(80,200,255,0.9)');
+  drawHand(octx, lastResults.rightHandLandmarks, W, H, 'rgba(120,255,160,0.9)');
+
+  // mouth landmarks
+  const f = lastResults.faceLandmarks;
+  if (f) {
+    octx.save();
+    octx.fillStyle = '#ff7bd5';
+    for (const idx of [13, 14, 61, 291]) {
+      if (!f[idx]) continue;
+      octx.beginPath();
+      octx.arc(SX(f[idx].x, W), f[idx].y * H, 4, 0, Math.PI*2);
+      octx.fill();
+    }
+    octx.restore();
+  }
+
+  // per-hand distance readout (palm-normalized; lower = more pinched)
+  octx.save();
+  octx.font = '12px monospace';
+  octx.textAlign = 'left';
+  let y = 70;
+  for (const label of ['Left', 'Right']) {
+    const st = handState[label];
+    const ds = st.dists ? st.dists.map(d => d.toFixed(2)).join(' ') : '—';
+    octx.fillStyle = st.active ? '#9f9' : '#bbb';
+    octx.fillText(`${label} thumb→[idx mid ring pinky]: ${ds}  pinch=${st.pinchCount}`, 12, y);
+    y += 18;
+  }
+  octx.fillStyle = mouthState.blowing ? '#9cf' : '#aaa';
+  octx.fillText(
+    `pinch<${PINCH_RATIO} · mouth purse=${mouthState.purse.toFixed(2)} (blow<${BLOW_PURSE}) open=${mouthState.open.toFixed(3)} ${mouthState.blowing?'◀ BLOW':''} · "d" toggles`,
+    12, y);
+  octx.restore();
+}
+
+function drawOverlay(t) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  const W = overlay.width, H = overlay.height;
+
+  if (DEBUG) drawDebugLandmarks(W, H);
+
+  for (const label of ['Left', 'Right']) {
+    const st = handState[label];
+    if (!st.active || !st.screen) { st.ring += (0 - st.ring) * 0.2; continue; }
+    st.ring += (1 - st.ring) * 0.2;
+
+    const cx = SX(st.screen.x, W); // mirror in code
+    const cy = st.screen.y * H;
+    const R  = 46;
+
+    // iridescent glowing ring (thin)
+    const hue = (t * 60) % 360;
+    octx.save();
+    octx.lineWidth = 4;
+    octx.shadowBlur = 18;
+    octx.shadowColor = `hsla(${hue}, 90%, 65%, ${0.9 * st.ring})`;
+    octx.strokeStyle = `hsla(${hue}, 90%, 70%, ${0.85 * st.ring})`;
+    drawShapeOutline(octx, cx, cy, R, st.shape, t);
+    octx.stroke();
+
+    // inner thin ring different hue
+    octx.lineWidth = 2;
+    octx.shadowBlur = 8;
+    octx.strokeStyle = `hsla(${(hue + 140) % 360}, 95%, 75%, ${0.6 * st.ring})`;
+    drawShapeOutline(octx, cx, cy, R * 0.82, st.shape, t);
+    octx.stroke();
+    octx.restore();
+
+    // shape + pinch count label above wand (no mirror hack needed now)
+    octx.save();
+    octx.fillStyle = `rgba(255,255,255,${0.85 * st.ring})`;
+    octx.font = '13px -apple-system, sans-serif';
+    octx.textAlign = 'center';
+    octx.shadowBlur = 4;
+    octx.shadowColor = 'rgba(0,0,0,0.6)';
+    octx.fillText(`${st.shape} · ${st.pinchCount}`, cx, cy - R - 14);
+    octx.restore();
+  }
+
+  // blow indicator
+  if (mouthState.blowing) {
+    octx.save();
+    octx.fillStyle = 'rgba(140, 220, 255, 0.9)';
+    octx.shadowBlur = 12;
+    octx.shadowColor = 'rgba(140,220,255,0.8)';
+    octx.beginPath();
+    octx.arc(W/2, 40, 7, 0, Math.PI*2);
+    octx.fill();
+    octx.restore();
+  }
+}
+
+// ============================================================
+//  RENDER LOOP (60fps target, decoupled from MediaPipe 30fps)
+// ============================================================
+const clock = new THREE.Clock();
+let hintHidden = false;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  clockNow += dt;
+  const t = clockNow;
+
+  // update global time uniform on base + clones
+  baseBubbleMaterial.uniforms.uTime.value = t;
+  for (const b of bubbles) b.mat.uniforms.uTime.value = t;
+
+  updateEmission(dt);
+  updateBubbles(dt);
+  drawOverlay(t);
+
+  // hide hint after a bubble is released (a free-floating one exists)
+  if (!hintHidden && bubbles.some(b => !b.charging)) {
+    hintHidden = true;
+    hintEl.style.opacity = '0';
+  }
+
+  // composite: webcam background, then bubbles
+  renderer.clear();
+  if (videoTexture) renderer.render(bgScene, bgCamera);
+  renderer.clearDepth();
+  renderer.render(scene, camera);
+
+  // status line
+  statusEl.textContent =
+    `bubbles ${bubbles.length}/${MAX_BUBBLES}  |  ` +
+    `L:${handState.Left.active ? handState.Left.shape : '–'} ` +
+    `R:${handState.Right.active ? handState.Right.shape : '–'}  |  ` +
+    `mouth ${mouthState.blowing ? 'BLOW' : 'open ' + mouthState.open.toFixed(3)}`;
+}
+
+// ============================================================
+//  RESIZE
+// ============================================================
+function onResize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  frustumHalfH = Math.tan((camera.fov * Math.PI / 180) / 2) * (camera.position.z - PLANE_Z);
+  frustumHalfW = frustumHalfH * camera.aspect;
+  resizeOverlay();
+  fitBackground();
+}
+window.addEventListener('resize', onResize);
+
+// ============================================================
+//  BOOT
+// ============================================================
+// Pump video frames into Holistic. Guards against overlapping sends
+// (holistic.send is async; calling again before it resolves throws).
+let sending = false;
+async function pumpFrame() {
+  if (!sending && video.readyState >= 2) {
+    sending = true;
+    try { await holistic.send({ image: video }); }
+    catch (e) { console.error('holistic.send failed:', e); }
+    sending = false;
+  }
+}
+
+function startPump() {
+  // Prefer requestVideoFrameCallback for webcam sync; else timer ~30fps.
+  if (video.requestVideoFrameCallback) {
+    const loop = async () => {
+      await pumpFrame();
+      video.requestVideoFrameCallback(loop);
+    };
+    video.requestVideoFrameCallback(loop);
+  } else {
+    setInterval(pumpFrame, 33);
+  }
+}
+
+async function boot() {
+  resizeOverlay();
+  animate();
+
+  // Single camera request. Do NOT use the MediaPipe Camera util — it calls
+  // getUserMedia again, causing a second permission prompt and a stream clash.
+  try {
+    statusEl.textContent = 'requesting camera…';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' },
+      audio: false
+    });
+    video.srcObject = stream;
+  } catch (err) {
+    statusEl.textContent = 'camera error: ' + err.message;
+    hintEl.textContent = 'Camera access is required. Allow webcam and reload.';
+    console.error(err);
+    return;
+  }
+
+  // Wait until the video actually has dimensions before sending frames.
+  await new Promise((res) => {
+    if (video.readyState >= 2 && video.videoWidth) return res();
+    video.addEventListener('loadedmetadata', res, { once: true });
+  });
+  try { await video.play(); } catch (e) { console.warn('video.play:', e); }
+  fitBackground();
+
+  statusEl.textContent = 'loading MediaPipe…';
+  startPump();
+}
+
+boot();
+</script>
+</body>
+</html>
