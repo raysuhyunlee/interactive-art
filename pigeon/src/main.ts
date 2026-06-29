@@ -1,132 +1,124 @@
 import './style.css';
+import * as THREE from 'three';
 import { startWebcam } from './camera';
-import {
-  createPoseLandmarker,
-  ARM_CONNECTIONS,
-  BODY_CONNECTIONS,
-  LM,
-  type Pose,
-} from './pose';
+import { createPoseLandmarker, readArms, type Pose } from './pose';
+import { Bird } from './bird';
+import { drawDebug } from './debug';
 
 const video = document.querySelector<HTMLVideoElement>('#webcam')!;
-const canvas = document.querySelector<HTMLCanvasElement>('#stage')!;
+const sceneCanvas = document.querySelector<HTMLCanvasElement>('#scene')!;
+const debugCanvas = document.querySelector<HTMLCanvasElement>('#debug')!;
 const hud = document.querySelector<HTMLDivElement>('#hud')!;
-const ctx = canvas.getContext('2d')!;
+const debugCtx = debugCanvas.getContext('2d')!;
 
-// Landmark indices that make up the arms — drawn as larger, brighter joints.
-const ARM_JOINTS = new Set<number>([
-  LM.leftShoulder,
-  LM.rightShoulder,
-  LM.leftElbow,
-  LM.rightElbow,
-  LM.leftWrist,
-  LM.rightWrist,
-]);
+const DEBUG_W = 280; // CSS px width of the bottom-right PIP
 
-// Device-pixel-aware sizing so the canvas stays crisp on retina displays.
-function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.round(window.innerWidth * dpr);
-  canvas.height = Math.round(window.innerHeight * dpr);
-  canvas.style.width = `${window.innerWidth}px`;
-  canvas.style.height = `${window.innerHeight}px`;
+// ---------------------------------------------------------------------------
+// Three.js scene
+// ---------------------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87b8e0); // daytime sky
+
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+// slightly elevated rear view: behind (+Z) and above (+Y), looking down a bit
+camera.position.set(0, 2.0, 5.0);
+camera.lookAt(0, 0.1, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+
+// faint ground plane so the bird has a sense of place (city comes in step 4)
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(200, 200),
+  new THREE.MeshStandardMaterial({ color: 0x4a7a4a, roughness: 1 }),
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -3;
+scene.add(ground);
+
+const bird = new Bird();
+scene.add(bird.group);
+
+function resizeScene() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  // updateStyle = true: also set the canvas CSS size. Without it the canvas
+  // renders at drawing-buffer size (viewport * dpr), so on retina it overflows
+  // and the centered scene drifts into the bottom-right corner.
+  renderer.setSize(w, h, true);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
 }
-window.addEventListener('resize', resize);
-resize();
+window.addEventListener('resize', resizeScene);
+resizeScene();
 
-// "cover" fit: the video fills the canvas, cropping overflow on the long axis.
-function coverRect(cw: number, ch: number, vw: number, vh: number) {
-  const scale = Math.max(cw / vw, ch / vh);
-  const w = vw * scale;
-  const h = vh * scale;
-  return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
-}
-
-let rect = { x: 0, y: 0, w: 0, h: 0 };
-
-// Landmark x is mirrored so the view reads like a selfie mirror.
-function px(lm: { x: number }) {
-  return rect.x + (1 - lm.x) * rect.w;
-}
-function py(lm: { y: number }) {
-  return rect.y + lm.y * rect.h;
-}
-
-function drawConnections(
-  pose: Pose,
-  connections: [number, number][],
-  color: string,
-  width: number,
-) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width;
-  ctx.lineCap = 'round';
-  for (const [a, b] of connections) {
-    const p = pose[a];
-    const q = pose[b];
-    if (!p || !q) continue;
-    ctx.beginPath();
-    ctx.moveTo(px(p), py(p));
-    ctx.lineTo(px(q), py(q));
-    ctx.stroke();
-  }
+// Map arm elevation (radians) to a wing angle, with a little gain and clamping
+// so fully-raised arms lift the wings high and lowered arms droop them.
+function toWingAngle(elevation: number): number {
+  return THREE.MathUtils.clamp(elevation * 1.15, -0.7, 1.35);
 }
 
-function drawPose(pose: Pose) {
-  const unit = Math.min(rect.w, rect.h);
-  drawConnections(pose, BODY_CONNECTIONS, 'rgba(255,255,255,0.35)', unit * 0.006);
-  drawConnections(pose, ARM_CONNECTIONS, '#27e0a0', unit * 0.012);
+// ---------------------------------------------------------------------------
+// Render loop — runs immediately and independently, so the bird is always on
+// screen even before (or without) the camera and pose model.
+// ---------------------------------------------------------------------------
+let lastPose: Pose | null = null;
 
-  // joints: arms big & bright, everything else small & dim
-  for (let i = 0; i < pose.length; i++) {
-    const lm = pose[i];
-    const isArm = ARM_JOINTS.has(i);
-    ctx.beginPath();
-    ctx.arc(px(lm), py(lm), unit * (isArm ? 0.012 : 0.005), 0, Math.PI * 2);
-    ctx.fillStyle = isArm ? '#fff' : 'rgba(255,255,255,0.4)';
-    ctx.fill();
-  }
+function renderLoop() {
+  bird.update();
+  renderer.render(scene, camera);
+  if (video.videoWidth > 0) drawDebug(debugCtx, video, lastPose);
+  requestAnimationFrame(renderLoop);
 }
+renderLoop();
 
-function drawFrame(pose: Pose | null) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  rect = coverRect(canvas.width, canvas.height, video.videoWidth, video.videoHeight);
-
-  // mirrored video background
-  ctx.save();
-  ctx.translate(rect.x + rect.w, rect.y);
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, rect.w, rect.h);
-  ctx.restore();
-
-  if (pose) drawPose(pose);
-}
-
-async function main() {
+// ---------------------------------------------------------------------------
+// Camera + pose pipeline — drives the wings once it's ready.
+// ---------------------------------------------------------------------------
+async function startTracking() {
   try {
     hud.textContent = 'requesting camera…';
     await startWebcam(video);
 
+    // size the debug PIP to the camera's aspect ratio
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const aspect = video.videoHeight / video.videoWidth;
+    debugCanvas.style.width = `${DEBUG_W}px`;
+    debugCanvas.style.height = `${Math.round(DEBUG_W * aspect)}px`;
+    debugCanvas.width = Math.round(DEBUG_W * dpr);
+    debugCanvas.height = Math.round(DEBUG_W * aspect * dpr);
+
     hud.textContent = 'loading pose model…';
     const landmarker = await createPoseLandmarker();
 
-    hud.textContent = 'tracking — move your arms';
+    hud.textContent = 'tracking — raise and flap your arms';
 
     let lastVideoTime = -1;
-    let lastPose: Pose | null = null;
 
-    const loop = () => {
-      // Only run inference when the video has a fresh frame.
+    const detectLoop = () => {
       if (video.currentTime !== lastVideoTime && video.videoWidth > 0) {
         lastVideoTime = video.currentTime;
         const result = landmarker.detectForVideo(video, performance.now());
         lastPose = result.landmarks[0] ?? null;
-        hud.textContent = lastPose ? 'arms tracked' : 'no person detected';
+
+        if (lastPose) {
+          const arms = readArms(lastPose);
+          if (arms.left.ok) bird.setWingTargetsLeft(toWingAngle(arms.left.elevation));
+          if (arms.right.ok) bird.setWingTargetsRight(toWingAngle(arms.right.elevation));
+          hud.textContent =
+            arms.left.ok || arms.right.ok ? 'tracking arms' : 'arms not visible';
+        } else {
+          hud.textContent = 'no person detected';
+        }
       }
-      drawFrame(lastPose);
-      requestAnimationFrame(loop);
+      requestAnimationFrame(detectLoop);
     };
-    requestAnimationFrame(loop);
+    requestAnimationFrame(detectLoop);
   } catch (err) {
     console.error(err);
     hud.textContent = `error: ${(err as Error).message}`;
@@ -134,4 +126,4 @@ async function main() {
   }
 }
 
-main();
+startTracking();

@@ -27,10 +27,23 @@ body {
   pointer-events: none;
 }
 
-#stage {
+#scene {
   position: fixed;
   inset: 0;
+  width: 100vw;
+  height: 100vh;
   display: block;
+}
+
+/* debug picture-in-picture: camera feed + pose overlay, bottom-right */
+#debug {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  background: #000;
 }
 
 #hud {

@@ -41,6 +41,42 @@ export const ARM_CONNECTIONS: [number, number][] = [
 
 export type Pose = NormalizedLandmark[];
 
+export interface ArmReading {
+  elevation: number; // radians: +up, 0 level, -down (relative to shoulder)
+  ok: boolean; // landmarks confident enough to trust
+}
+
+export interface Arms {
+  left: ArmReading;
+  right: ArmReading;
+}
+
+const VIS_MIN = 0.5;
+
+// Elevation of the hand relative to the shoulder: vertical rise over horizontal
+// reach. ~+pi/2 when the arm is straight up, ~0 when held out level, negative
+// when lowered. Independent of distance from the camera.
+function armElevation(shoulder: NormalizedLandmark, wrist: NormalizedLandmark): number {
+  const dy = shoulder.y - wrist.y; // image y is top-down, so flip to make up +
+  const dx = Math.abs(wrist.x - shoulder.x);
+  return Math.atan2(dy, dx + 1e-3);
+}
+
+export function readArms(pose: Pose): Arms {
+  const ls = pose[LM.leftShoulder];
+  const lw = pose[LM.leftWrist];
+  const rs = pose[LM.rightShoulder];
+  const rw = pose[LM.rightWrist];
+
+  const okL = (ls?.visibility ?? 0) > VIS_MIN && (lw?.visibility ?? 0) > VIS_MIN;
+  const okR = (rs?.visibility ?? 0) > VIS_MIN && (rw?.visibility ?? 0) > VIS_MIN;
+
+  return {
+    left: { elevation: okL ? armElevation(ls, lw) : 0, ok: okL },
+    right: { elevation: okR ? armElevation(rs, rw) : 0, ok: okR },
+  };
+}
+
 export async function createPoseLandmarker(): Promise<PoseLandmarker> {
   const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
   return PoseLandmarker.createFromOptions(fileset, {
