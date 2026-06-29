@@ -28,6 +28,7 @@ export class Bird {
   private readonly rightWing = new THREE.Group();
   private targetLeft = 0;
   private targetRight = 0;
+  private targetBank = 0;
 
   constructor() {
     const bodyMat = new THREE.MeshStandardMaterial({ color: 0x6b7785, roughness: 0.85 });
@@ -93,6 +94,12 @@ export class Bird {
     this.targetRight = angle;
   }
 
+  // Bank (roll) the whole body around its forward axis. Pure rotation — this is
+  // visualization of tilt, not flight physics.
+  setBankTarget(roll: number): void {
+    this.targetBank = roll;
+  }
+
   // Call once per frame. Smoothly eases each wing toward its target so jittery
   // pose data doesn't make the wings buzz.
   update(): void {
@@ -106,6 +113,11 @@ export class Bird {
       this.rightWing.rotation.z,
       this.targetRight,
       0.35,
+    );
+    this.group.rotation.z = THREE.MathUtils.lerp(
+      this.group.rotation.z,
+      this.targetBank,
+      0.15,
     );
   }
 }

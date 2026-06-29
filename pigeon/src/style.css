@@ -50,14 +50,77 @@ body {
   position: fixed;
   top: 16px;
   left: 16px;
-  padding: 6px 12px;
-  border-radius: 6px;
+  width: 220px;
+  padding: 12px 14px;
+  border-radius: 8px;
   background: rgba(0, 0, 0, 0.5);
-  font-size: 14px;
+  font-size: 13px;
   letter-spacing: 0.2px;
   backdrop-filter: blur(4px);
 }
 
 #hud.error {
   background: rgba(180, 30, 30, 0.7);
+}
+
+#status {
+  margin-bottom: 10px;
+}
+
+.meter {
+  margin-top: 10px;
+}
+
+.meter .label {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 12px;
+  opacity: 0.85;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.bar {
+  position: relative;
+  height: 10px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+#flap-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #27e0a0, #7defc0);
+  transition: width 0.08s linear;
+}
+
+#flap-fill.pulse {
+  box-shadow: 0 0 10px 2px #27e0a0;
+}
+
+.bar.center {
+  overflow: visible;
+}
+
+.midline {
+  position: absolute;
+  left: 50%;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+#tilt-knob {
+  position: absolute;
+  top: -3px;
+  left: 50%;
+  width: 6px;
+  height: 16px;
+  border-radius: 3px;
+  background: #ffd23f;
+  transform: translateX(-50%);
+  transition: left 0.08s linear;
 }

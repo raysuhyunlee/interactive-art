@@ -1,17 +1,28 @@
 import './style.css';
 import * as THREE from 'three';
 import { startWebcam } from './camera';
-import { createPoseLandmarker, readArms, type Pose } from './pose';
+import { createPoseLandmarker, readArms, type Arms, type Pose } from './pose';
 import { Bird } from './bird';
 import { drawDebug } from './debug';
+import { MotionAnalyzer } from './motion';
+import { Hud } from './hud';
 
 const video = document.querySelector<HTMLVideoElement>('#webcam')!;
 const sceneCanvas = document.querySelector<HTMLCanvasElement>('#scene')!;
 const debugCanvas = document.querySelector<HTMLCanvasElement>('#debug')!;
-const hud = document.querySelector<HTMLDivElement>('#hud')!;
 const debugCtx = debugCanvas.getContext('2d')!;
 
+const hud = new Hud();
+const analyzer = new MotionAnalyzer();
+
 const DEBUG_W = 280; // CSS px width of the bottom-right PIP
+
+// max bank angle (rad) the bird rolls to at full tilt
+const MAX_ROLL = 0.6;
+const NO_ARMS: Arms = {
+  left: { elevation: 0, ok: false },
+  right: { elevation: 0, ok: false },
+};
 
 // ---------------------------------------------------------------------------
 // Three.js scene
@@ -82,7 +93,7 @@ renderLoop();
 // ---------------------------------------------------------------------------
 async function startTracking() {
   try {
-    hud.textContent = 'requesting camera…';
+    hud.setStatus('requesting camera…');
     await startWebcam(video);
 
     // size the debug PIP to the camera's aspect ratio
@@ -93,36 +104,41 @@ async function startTracking() {
     debugCanvas.width = Math.round(DEBUG_W * dpr);
     debugCanvas.height = Math.round(DEBUG_W * aspect * dpr);
 
-    hud.textContent = 'loading pose model…';
+    hud.setStatus('loading pose model…');
     const landmarker = await createPoseLandmarker();
 
-    hud.textContent = 'tracking — raise and flap your arms';
+    hud.setStatus('tracking — flap and tilt your arms');
 
     let lastVideoTime = -1;
 
     const detectLoop = () => {
       if (video.currentTime !== lastVideoTime && video.videoWidth > 0) {
         lastVideoTime = video.currentTime;
-        const result = landmarker.detectForVideo(video, performance.now());
+        const now = performance.now();
+        const result = landmarker.detectForVideo(video, now);
         lastPose = result.landmarks[0] ?? null;
 
-        if (lastPose) {
-          const arms = readArms(lastPose);
-          if (arms.left.ok) bird.setWingTargetsLeft(toWingAngle(arms.left.elevation));
-          if (arms.right.ok) bird.setWingTargetsRight(toWingAngle(arms.right.elevation));
-          hud.textContent =
-            arms.left.ok || arms.right.ok ? 'tracking arms' : 'arms not visible';
-        } else {
-          hud.textContent = 'no person detected';
-        }
+        const arms = lastPose ? readArms(lastPose) : NO_ARMS;
+
+        // direct mapping: each arm drives its wing
+        if (arms.left.ok) bird.setWingTargetsLeft(toWingAngle(arms.left.elevation));
+        if (arms.right.ok) bird.setWingTargetsRight(toWingAngle(arms.right.elevation));
+
+        // derived signals: flap + tilt
+        const motion = analyzer.update(arms, now);
+        bird.setBankTarget(-motion.tilt * MAX_ROLL);
+        hud.update(motion);
+
+        if (!lastPose) hud.setStatus('no person detected');
+        else if (!arms.left.ok && !arms.right.ok) hud.setStatus('arms not visible');
+        else hud.setStatus('tracking — flap and tilt your arms');
       }
       requestAnimationFrame(detectLoop);
     };
     requestAnimationFrame(detectLoop);
   } catch (err) {
     console.error(err);
-    hud.textContent = `error: ${(err as Error).message}`;
-    hud.classList.add('error');
+    hud.setError(`error: ${(err as Error).message}`);
   }
 }
 
