@@ -4,10 +4,15 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>pigeon</title>
+    <title>pigeon — pose</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <!-- hidden source video; frames are drawn into the canvas mirrored -->
+      <video id="webcam" playsinline muted></video>
+      <canvas id="stage"></canvas>
+      <div id="hud">starting…</div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
