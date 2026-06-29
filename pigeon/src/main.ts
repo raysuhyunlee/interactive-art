@@ -4,8 +4,9 @@ import { startWebcam } from './camera';
 import { createPoseLandmarker, readArms, type Arms, type Pose } from './pose';
 import { Bird } from './bird';
 import { drawDebug } from './debug';
-import { MotionAnalyzer } from './motion';
+import { MotionAnalyzer, type MotionState } from './motion';
 import { Hud } from './hud';
+import { BirdPhysics } from './physics';
 
 const video = document.querySelector<HTMLVideoElement>('#webcam')!;
 const sceneCanvas = document.querySelector<HTMLCanvasElement>('#scene')!;
@@ -14,11 +15,18 @@ const debugCtx = debugCanvas.getContext('2d')!;
 
 const hud = new Hud();
 const analyzer = new MotionAnalyzer();
+const physics = new BirdPhysics();
+
+// latest motion signals, written by the pose loop and read by the render loop
+let motion: MotionState = { flapHz: 0, flapPower: 0, tilt: 0, flapped: false };
 
 const DEBUG_W = 280; // CSS px width of the bottom-right PIP
 
 // max bank angle (rad) the bird rolls to at full tilt
 const MAX_ROLL = 0.6;
+// camera offset behind/above the bird as it climbs and falls
+const CAM_BACK = 5.0;
+const CAM_UP = 2.0;
 const NO_ARMS: Arms = {
   left: { elevation: 0, ok: false },
   right: { elevation: 0, ok: false },
@@ -79,9 +87,28 @@ function toWingAngle(elevation: number): number {
 // screen even before (or without) the camera and pose model.
 // ---------------------------------------------------------------------------
 let lastPose: Pose | null = null;
+const clock = new THREE.Clock();
 
 function renderLoop() {
+  const dt = Math.min(clock.getDelta(), 0.05); // clamp to avoid post-stall jumps
+
+  // physics: flapping lifts, gravity pulls, tilt turns
+  physics.update(dt, motion.flapPower, motion.tilt);
+  bird.group.position.copy(physics.position);
+  bird.group.rotation.y = physics.heading;
+
+  // chase cam: sit behind the bird along its heading so turns read naturally
+  const back = physics.forward.multiplyScalar(-CAM_BACK);
+  camera.position.set(
+    physics.position.x + back.x,
+    physics.position.y + CAM_UP,
+    physics.position.z + back.z,
+  );
+  camera.lookAt(physics.position.x, physics.position.y + 0.1, physics.position.z);
+
   bird.update();
+  hud.setFlight(physics.altitude, physics.speed, physics.headingDeg);
+
   renderer.render(scene, camera);
   if (video.videoWidth > 0) drawDebug(debugCtx, video, lastPose);
   requestAnimationFrame(renderLoop);
@@ -124,8 +151,8 @@ async function startTracking() {
         if (arms.left.ok) bird.setWingTargetsLeft(toWingAngle(arms.left.elevation));
         if (arms.right.ok) bird.setWingTargetsRight(toWingAngle(arms.right.elevation));
 
-        // derived signals: flap + tilt
-        const motion = analyzer.update(arms, now);
+        // derived signals: flap + tilt (shared with the physics/render loop)
+        motion = analyzer.update(arms, now);
         bird.setBankTarget(-motion.tilt * MAX_ROLL);
         hud.update(motion);
 

@@ -4,6 +4,11 @@ function el<T extends HTMLElement>(sel: string): T {
   return document.querySelector<T>(sel)!;
 }
 
+const POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+function compass(deg: number): string {
+  return POINTS[Math.round(deg / 45) % 8];
+}
+
 // Live readout of the motion signals: flap power bar + frequency, tilt knob.
 export class Hud {
   private root = el<HTMLDivElement>('#hud');
@@ -11,10 +16,19 @@ export class Hud {
   private flapFill = el<HTMLDivElement>('#flap-fill');
   private flapHz = el<HTMLSpanElement>('#flap-hz');
   private tiltKnob = el<HTMLDivElement>('#tilt-knob');
+  private altVal = el<HTMLSpanElement>('#alt-val');
+  private spdVal = el<HTMLSpanElement>('#spd-val');
+  private hdgVal = el<HTMLSpanElement>('#hdg-val');
   private pulseTimer = 0;
 
   setStatus(text: string): void {
     this.status.textContent = text;
+  }
+
+  setFlight(altitude: number, speed: number, headingDeg: number): void {
+    this.altVal.textContent = altitude.toFixed(1);
+    this.spdVal.textContent = speed.toFixed(1);
+    this.hdgVal.textContent = `${compass(headingDeg)} ${Math.round(headingDeg)}°`;
   }
 
   setError(text: string): void {
