@@ -9,6 +9,7 @@ import { Hud } from './hud';
 import { BirdPhysics } from './physics';
 import { createWorld } from './world';
 import { Flock } from './flock';
+import { FlapAudio } from './audio';
 
 const video = document.querySelector<HTMLVideoElement>('#webcam')!;
 const sceneCanvas = document.querySelector<HTMLCanvasElement>('#scene')!;
@@ -18,6 +19,7 @@ const debugCtx = debugCanvas.getContext('2d')!;
 const hud = new Hud();
 const analyzer = new MotionAnalyzer();
 const physics = new BirdPhysics();
+const flapAudio = new FlapAudio();
 
 // latest motion signals, written by the pose loop and read by the render loop
 let motion: MotionState = { flapHz: 0, flapPower: 0, tilt: 0, flapped: false };
@@ -178,6 +180,7 @@ async function startTracking() {
         motion = analyzer.update(arms, now);
         bird.setBankTarget(-motion.tilt * MAX_ROLL);
         hud.update(motion);
+        if (motion.flapped) flapAudio.flap(motion.flapPower);
 
         if (!lastPose) hud.setStatus('no person detected');
         else if (!arms.left.ok && !arms.right.ok) hud.setStatus('arms not visible');
