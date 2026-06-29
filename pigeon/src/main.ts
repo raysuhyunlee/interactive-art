@@ -7,6 +7,8 @@ import { drawDebug } from './debug';
 import { MotionAnalyzer, type MotionState } from './motion';
 import { Hud } from './hud';
 import { BirdPhysics } from './physics';
+import { createWorld } from './world';
+import { Flock } from './flock';
 
 const video = document.querySelector<HTMLVideoElement>('#webcam')!;
 const sceneCanvas = document.querySelector<HTMLCanvasElement>('#scene')!;
@@ -27,6 +29,8 @@ const MAX_ROLL = 0.6;
 // camera offset behind/above the bird as it climbs and falls
 const CAM_BACK = 5.0;
 const CAM_UP = 2.0;
+// debug: ?top in the URL gives a fixed aerial view of the whole scene
+const TOPCAM = new URLSearchParams(location.search).has('top');
 const NO_ARMS: Arms = {
   left: { elevation: 0, ok: false },
   right: { elevation: 0, ok: false },
@@ -40,8 +44,9 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87b8e0); // daytime sky
+scene.fog = new THREE.Fog(0x87b8e0, 160, 650); // haze that fades distant peaks
 
-const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 3000);
 // slightly elevated rear view: behind (+Z) and above (+Y), looking down a bit
 camera.position.set(0, 2.0, 5.0);
 camera.lookAt(0, 0.1, 0);
@@ -51,14 +56,22 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.1);
 sun.position.set(3, 6, 4);
 scene.add(sun);
 
-// faint ground plane so the bird has a sense of place (city comes in step 4)
+// ground plane large enough to reach the distant mountains
 const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(200, 200),
+  new THREE.PlaneGeometry(800, 800),
   new THREE.MeshStandardMaterial({ color: 0x4a7a4a, roughness: 1 }),
 );
 ground.rotation.x = -Math.PI / 2;
 ground.position.y = -3;
 scene.add(ground);
+
+// city + scenery, randomly placed around the origin
+const world = createWorld();
+scene.add(world.group);
+
+// other pigeons flying around on their own
+const flock = new Flock();
+scene.add(flock.group);
 
 const bird = new Bird();
 scene.add(bird.group);
@@ -92,19 +105,29 @@ const clock = new THREE.Clock();
 function renderLoop() {
   const dt = Math.min(clock.getDelta(), 0.05); // clamp to avoid post-stall jumps
 
+  // animate the living world
+  world.update(dt);
+  flock.update(dt);
+
   // physics: flapping lifts, gravity pulls, tilt turns
   physics.update(dt, motion.flapPower, motion.tilt);
   bird.group.position.copy(physics.position);
   bird.group.rotation.y = physics.heading;
 
-  // chase cam: sit behind the bird along its heading so turns read naturally
-  const back = physics.forward.multiplyScalar(-CAM_BACK);
-  camera.position.set(
-    physics.position.x + back.x,
-    physics.position.y + CAM_UP,
-    physics.position.z + back.z,
-  );
-  camera.lookAt(physics.position.x, physics.position.y + 0.1, physics.position.z);
+  if (TOPCAM) {
+    // debug skyline establishing shot (?top in the URL)
+    camera.position.set(0, 30, 95);
+    camera.lookAt(0, 16, 0);
+  } else {
+    // chase cam: sit behind the bird along its heading so turns read naturally
+    const back = physics.forward.multiplyScalar(-CAM_BACK);
+    camera.position.set(
+      physics.position.x + back.x,
+      physics.position.y + CAM_UP,
+      physics.position.z + back.z,
+    );
+    camera.lookAt(physics.position.x, physics.position.y + 0.1, physics.position.z);
+  }
 
   bird.update();
   hud.setFlight(physics.altitude, physics.speed, physics.headingDeg);
